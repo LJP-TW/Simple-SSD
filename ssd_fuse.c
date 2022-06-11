@@ -210,16 +210,21 @@ static unsigned int get_next_pca()
     return curr_pca.pca;
 }
 
-static int ftl_set_stale(int lba)
+static unsigned int ftl_get_pca(int lba)
+{
+    return L2P[lba].pca;
+}
+
+static int ftl_set_stale(unsigned int p)
 {
     PCA_RULE pca;
 
-    pca.pca = L2P[lba].pca;
-
-    if (pca.pca == INVALID_PCA)
+    if (p == INVALID_PCA)
     {
         return 0;
     }
+
+    pca.pca = p;
 
     block_state[pca.nand].stale_count += 1;
     block_state[pca.nand].stale |= (1 << pca.lba);
@@ -392,6 +397,7 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
     int idx, curr_size, remain_size;
     char* tmp_buf;
     int ret;
+    unsigned int pca;
 
     if (!size)
     {
@@ -412,13 +418,15 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
 
     for (remain_size = size; remain_size >= PAGESIZE; remain_size -= PAGESIZE)
     {
-        ftl_set_stale(tmp_lba + idx);
+        pca = ftl_get_pca(tmp_lba + idx);
         ret = ftl_write(&buf[PAGESIZE * idx], tmp_lba_range - idx, tmp_lba + idx);
 
         if (ret <= 0)
         {
             return ret;
         }
+
+        ftl_set_stale(pca);
 
         idx += 1;
         curr_size += PAGESIZE;
@@ -441,7 +449,7 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
         memcpy(tmp_buf, &buf[curr_size], remain_size);
 
         //write
-        ftl_set_stale(tmp_lba + idx);
+        pca = ftl_get_pca(tmp_lba + idx);
         ret = ftl_write(tmp_buf, 1, tmp_lba + idx);
 
         if (ret <= 0)
@@ -449,6 +457,8 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
             free(tmp_buf);
             return ret;
         }
+
+        ftl_set_stale(pca);
 
         free(tmp_buf);
     }
@@ -461,6 +471,9 @@ static int ssd_write(const char* path, const char* buf, size_t size,
 {
 
     (void) fi;
+    
+    printf("\n\n[WRITE] OFFSET %0#8lx | SIZE: %0#8lx\n\n", offset, size);
+
     if (ssd_file_type(path) != SSD_FILE)
     {
         return -EINVAL;
@@ -502,6 +515,30 @@ static int ssd_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
     return 0;
 }
 
+static void debug(void)
+{
+    printf("[DEBUG]\n");
+    
+    printf("%lx / %lx\n", nand_write_size, host_write_size);
+
+    for (int i = 0; i < PHYSICAL_NAND_NUM; ++i)
+    {
+        if (block_state[i].state == FREE_BLOCK)
+        {
+            printf("NAND_%d | Invalid\n", i);
+        }
+        else
+        {
+            printf("NAND_%d | V: %d | S: %d, %0#8x\n", i, 
+                   block_state[i].valid_count,
+                   block_state[i].stale_count,
+                   block_state[i].stale);
+        }
+    }
+
+    printf("[DEBUG END]\n");
+}
+
 static int ssd_ioctl(const char* path, unsigned int cmd, void* arg,
                      struct fuse_file_info* fi, unsigned int flags, void* data)
 {
@@ -523,6 +560,7 @@ static int ssd_ioctl(const char* path, unsigned int cmd, void* arg,
             *(size_t*)data = physic_size;
             return 0;
         case SSD_GET_WA:
+            debug();
             *(double*)data = (double)nand_write_size / (double)host_write_size;
             return 0;
     }
