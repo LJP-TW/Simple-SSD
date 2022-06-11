@@ -25,6 +25,11 @@ enum
 
 #define PAGESIZE 512
 
+// Find First bit Set
+#define ffs(x) __builtin_ffs(x)
+
+#define PCA_ADDR(pca) (pca.nand * PAGE_PER_BLOCK + pca.pidx)
+
 static size_t physic_size;
 static size_t logic_size;
 static size_t host_write_size;
@@ -38,7 +43,7 @@ struct pca_rule
         unsigned int pca;
         struct
         {
-            unsigned int lba : 16;
+            unsigned int pidx: 16;
             unsigned int nand: 16;
         };
     };
@@ -50,21 +55,27 @@ struct state_rule
     union
     {
         unsigned int state;
-        struct 
+        struct
         {
+            unsigned int free       : 12;
+            unsigned int stale      : 12;
             unsigned int valid_count: 8;
-            unsigned int stale_count: 8;
-            unsigned int stale      : 16;
         };
     };
 };
+
+#ifdef DEBUG
+static void debug(void);
+#endif
+
+static int gc(void);
 
 PCA_RULE curr_pca;
 static unsigned int get_next_pca();
 
 PCA_RULE* L2P;
 STATE_RULE* block_state;
-unsigned int* P2L, free_block_number;
+unsigned int* P2L, free_block_number, gc_blockid;
 
 static int ssd_resize(size_t new_size)
 {
@@ -105,7 +116,7 @@ static int nand_read(char* buf, int pca)
     //read
     if ((fptr = fopen(nand_name, "r")))
     {
-        fseek(fptr, my_pca.lba * PAGESIZE, SEEK_SET);
+        fseek(fptr, my_pca.pidx * PAGESIZE, SEEK_SET);
         fread(buf, 1, PAGESIZE, fptr);
         fclose(fptr);
     }
@@ -129,11 +140,12 @@ static int nand_write(const char* buf, int pca)
     //write
     if ((fptr = fopen(nand_name, "r+")))
     {
-        fseek(fptr, my_pca.lba * PAGESIZE, SEEK_SET);
+        fseek(fptr, my_pca.pidx * PAGESIZE, SEEK_SET);
         fwrite(buf, 1, PAGESIZE, fptr);
         fclose(fptr);
-        physic_size ++;
+        physic_size++;
         block_state[my_pca.nand].valid_count++;
+        block_state[my_pca.nand].free &= ~(1 << my_pca.pidx);
     }
     else
     {
@@ -168,9 +180,10 @@ static unsigned int get_next_block()
         if (block_state[(curr_pca.nand + i) % PHYSICAL_NAND_NUM].state == FREE_BLOCK)
         {
             curr_pca.nand = (curr_pca.nand + i) % PHYSICAL_NAND_NUM;
-            curr_pca.lba = 0;
+            curr_pca.pidx = 0;
             free_block_number--;
             block_state[curr_pca.nand].state = 0;
+            block_state[curr_pca.nand].free = (1 << PAGE_PER_BLOCK) - 1;
             return curr_pca.pca;
         }
     }
@@ -179,35 +192,32 @@ static unsigned int get_next_block()
 
 static unsigned int get_next_pca()
 {
+    //init
     if (curr_pca.pca == INVALID_PCA)
     {
         curr_pca.pca = 0;
         block_state[0].state = 0;
+        block_state[curr_pca.nand].free = (1 << PAGE_PER_BLOCK) - 1;
         free_block_number--;
         return curr_pca.pca;
     }
 
-    if (curr_pca.lba == 9)
+    do
     {
-        int temp = get_next_block();
-        if (temp == OUT_OF_BLOCK)
+        if (block_state[curr_pca.nand].free)
         {
-            return OUT_OF_BLOCK;
+            curr_pca.pidx = ffs(block_state[curr_pca.nand].free) - 1;
+
+            return curr_pca.pca;
         }
-        else if (temp == -EINVAL)
+
+        if (free_block_number != 1)
         {
-            return -EINVAL;
+            return get_next_block();
         }
-        else
-        {
-            return temp;
-        }
-    }
-    else
-    {
-        curr_pca.lba += 1;
-    }
-    return curr_pca.pca;
+
+        gc();
+    } while (1);
 }
 
 static unsigned int ftl_get_pca(int lba)
@@ -226,8 +236,8 @@ static int ftl_set_stale(unsigned int p)
 
     pca.pca = p;
 
-    block_state[pca.nand].stale_count += 1;
-    block_state[pca.nand].stale |= (1 << pca.lba);
+    block_state[pca.nand].valid_count--;
+    block_state[pca.nand].stale |= (1 << pca.pidx);
 
     return 1;
 }
@@ -240,7 +250,7 @@ static int ftl_read(char* buf, int lba)
 {
     PCA_RULE pca;
     int ret;
-    
+
     pca.pca = L2P[lba].pca;
 
     if (pca.pca == INVALID_PCA)
@@ -260,19 +270,20 @@ static int ftl_read(char* buf, int lba)
  */
 static int ftl_write(const char* buf, int lba_range, int lba)
 {
-    int pca;
+    PCA_RULE pca;
     int ret;
 
-    pca = get_next_pca();
+    pca.pca = get_next_pca();
 
-    if (pca < 0 || pca == OUT_OF_BLOCK)
+    if (pca.pca < 0 || pca.pca == OUT_OF_BLOCK)
     {
         return 0;
     }
 
-    ret = nand_write(buf, pca);
+    ret = nand_write(buf, pca.pca);
 
-    L2P[lba].pca = pca;
+    L2P[lba].pca = pca.pca;
+    P2L[PCA_ADDR(pca)] = lba;
 
     return ret;
 }
@@ -286,8 +297,76 @@ static int ftl_write(const char* buf, int lba_range, int lba)
  */
 static int gc(void)
 {
-    // TODO
-    return -1;
+    int blockid, minv, valid;
+    char *buf;
+    PCA_RULE target_pca;
+
+    blockid = -1;
+    minv = PAGE_PER_BLOCK + 1;
+
+    for (int i = 0; i < PHYSICAL_NAND_NUM; ++i)
+    {
+        if (block_state[i].valid_count < minv)
+        {
+            minv = block_state[i].valid_count;
+            blockid = i;
+        }
+    }
+
+    if (minv == PAGE_PER_BLOCK)
+    {
+        // No space
+        return -1;
+    }
+
+    buf = calloc(PAGESIZE, sizeof(char));
+
+    target_pca.nand = blockid;
+
+    curr_pca.nand = gc_blockid;
+    curr_pca.pidx = 0;
+
+    block_state[gc_blockid].state = 0;
+    block_state[gc_blockid].free = (1 << PAGE_PER_BLOCK) - 1;
+
+    valid = ~block_state[blockid].free & ((1 << PAGE_PER_BLOCK) - 1);
+    valid &= ~block_state[blockid].stale;
+
+    while (valid)
+    {
+        int pidx;
+        int lba;
+
+        pidx = ffs(valid) - 1;
+
+        if (pidx == -1) {
+            break;
+        }
+
+        target_pca.pidx = pidx;
+
+        nand_read(buf, target_pca.pca);
+        nand_write(buf, curr_pca.pca);
+
+        lba = P2L[PCA_ADDR(target_pca)];
+
+        L2P[lba].pca = curr_pca.pca;
+
+        P2L[PCA_ADDR(curr_pca)] = lba;
+        P2L[PCA_ADDR(target_pca)] = INVALID_LBA;
+        
+        curr_pca.pidx++;
+
+        valid &= ~(1 << pidx);
+    }
+
+    free(buf);
+
+    nand_erase(blockid);
+
+    gc_blockid = blockid;
+
+    return 0;
 }
 
 static int ssd_file_type(const char* path)
@@ -363,7 +442,7 @@ static int ssd_do_read(char* buf, size_t size, off_t offset)
     for (remain_size = size; remain_size >= 0; remain_size -= PAGESIZE)
     {
         ret = ftl_read(tmp_buf, tmp_lba + idx);
-        
+
         if (ret <= 0)
         {
             return ret;
@@ -444,7 +523,7 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
             free(tmp_buf);
             return ret;
         }
-        
+
         //modify
         memcpy(tmp_buf, &buf[curr_size], remain_size);
 
@@ -471,9 +550,6 @@ static int ssd_write(const char* path, const char* buf, size_t size,
 {
 
     (void) fi;
-    
-    printf("\n\n[WRITE] OFFSET %0#8lx | SIZE: %0#8lx\n\n", offset, size);
-
     if (ssd_file_type(path) != SSD_FILE)
     {
         return -EINVAL;
@@ -490,6 +566,7 @@ static int ssd_truncate(const char* path, off_t size,
     memset(block_state, FREE_BLOCK, sizeof(STATE_RULE) * PHYSICAL_NAND_NUM);
     curr_pca.pca = INVALID_PCA;
     free_block_number = PHYSICAL_NAND_NUM;
+    gc_blockid = PHYSICAL_NAND_NUM - 1;
     if (ssd_file_type(path) != SSD_FILE)
     {
         return -EINVAL;
@@ -515,10 +592,11 @@ static int ssd_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
     return 0;
 }
 
+#ifdef DEBUG
 static void debug(void)
 {
     printf("[DEBUG]\n");
-    
+
     printf("%lx / %lx\n", nand_write_size, host_write_size);
 
     for (int i = 0; i < PHYSICAL_NAND_NUM; ++i)
@@ -529,15 +607,18 @@ static void debug(void)
         }
         else
         {
-            printf("NAND_%d | V: %d | S: %d, %0#8x\n", i, 
+            printf("NAND_%d | V: %d | F: %0#8x | S: %0#8x\n", i,
                    block_state[i].valid_count,
-                   block_state[i].stale_count,
+                   block_state[i].free,
                    block_state[i].stale);
         }
     }
 
+    printf("GC: NAND_%d\n", gc_blockid);
+
     printf("[DEBUG END]\n");
 }
+#endif
 
 static int ssd_ioctl(const char* path, unsigned int cmd, void* arg,
                      struct fuse_file_info* fi, unsigned int flags, void* data)
@@ -560,7 +641,9 @@ static int ssd_ioctl(const char* path, unsigned int cmd, void* arg,
             *(size_t*)data = physic_size;
             return 0;
         case SSD_GET_WA:
+#ifdef DEBUG
             debug();
+#endif
             *(double*)data = (double)nand_write_size / (double)host_write_size;
             return 0;
     }
@@ -586,7 +669,7 @@ int main(int argc, char* argv[])
     logic_size = 0;
     curr_pca.pca = INVALID_PCA;
     free_block_number = PHYSICAL_NAND_NUM;
-
+    gc_blockid = PHYSICAL_NAND_NUM - 1;
     L2P = malloc(LOGICAL_NAND_NUM * PAGE_PER_BLOCK * sizeof(PCA_RULE));
     memset(L2P, INVALID_PCA, sizeof(PCA_RULE) * LOGICAL_NAND_NUM * PAGE_PER_BLOCK);
     P2L = malloc(PHYSICAL_NAND_NUM * PAGE_PER_BLOCK * sizeof(int));
