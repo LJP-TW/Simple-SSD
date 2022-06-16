@@ -220,28 +220,6 @@ static unsigned int get_next_pca()
     } while (1);
 }
 
-static unsigned int ftl_get_pca(int lba)
-{
-    return L2P[lba].pca;
-}
-
-static int ftl_set_stale(unsigned int p)
-{
-    PCA_RULE pca;
-
-    if (p == INVALID_PCA)
-    {
-        return 0;
-    }
-
-    pca.pca = p;
-
-    block_state[pca.nand].valid_count--;
-    block_state[pca.nand].stale |= (1 << pca.pidx);
-
-    return 1;
-}
-
 /*
  * 1. Check L2P to get PCA
  * 2. Send read data into tmp_buffer
@@ -255,7 +233,8 @@ static int ftl_read(char* buf, int lba)
 
     if (pca.pca == INVALID_PCA)
     {
-        return 0;
+        memset(buf, 0, PAGESIZE);
+        return PAGESIZE;
     }
 
     ret = nand_read(buf, pca.pca);
@@ -270,9 +249,10 @@ static int ftl_read(char* buf, int lba)
  */
 static int ftl_write(const char* buf, int lba_range, int lba)
 {
-    PCA_RULE pca;
+    PCA_RULE pca, oldpca;
     int ret;
 
+    oldpca.pca = L2P[lba].pca;
     pca.pca = get_next_pca();
 
     if (pca.pca < 0 || pca.pca == OUT_OF_BLOCK)
@@ -284,6 +264,15 @@ static int ftl_write(const char* buf, int lba_range, int lba)
 
     L2P[lba].pca = pca.pca;
     P2L[PCA_ADDR(pca)] = lba;
+
+    // Set stale
+    if (oldpca.pca == INVALID_PCA)
+    {
+        return ret;
+    }
+
+    block_state[oldpca.nand].valid_count--;
+    block_state[oldpca.nand].stale |= (1 << oldpca.pidx);
 
     return ret;
 }
@@ -418,7 +407,7 @@ static int ssd_open(const char* path, struct fuse_file_info* fi)
 
 static int ssd_do_read(char* buf, size_t size, off_t offset)
 {
-    int tmp_lba, ret;
+    int tmp_lba;
     int idx, curr_size, remain_size;
     char* tmp_buf;
 
@@ -438,25 +427,32 @@ static int ssd_do_read(char* buf, size_t size, off_t offset)
 
     idx = 0;
     curr_size = 0;
+    remain_size = size;
 
-    for (remain_size = size; remain_size >= 0; remain_size -= PAGESIZE)
+    while (remain_size > 0)
     {
+        int ret, rsize;
+
         ret = ftl_read(tmp_buf, tmp_lba + idx);
 
         if (ret <= 0)
         {
-            return ret;
+            break;
         }
 
-        memcpy(&buf[curr_size], tmp_buf, remain_size > PAGESIZE ? PAGESIZE : remain_size);
+        offset = (offset + curr_size) % PAGESIZE;
+        rsize = remain_size > PAGESIZE - offset ? PAGESIZE - offset : remain_size;
+
+        memcpy(&buf[curr_size], &tmp_buf[offset], rsize);
 
         idx += 1;
-        curr_size += PAGESIZE;
+        curr_size += rsize;
+        remain_size -= rsize;
     }
 
     free(tmp_buf);
 
-    return size;
+    return curr_size;
 }
 
 static int ssd_read(const char* path, char* buf, size_t size,
@@ -476,7 +472,6 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
     int idx, curr_size, remain_size;
     char* tmp_buf;
     int ret;
-    unsigned int pca;
 
     if (!size)
     {
@@ -491,58 +486,59 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
 
     tmp_lba = offset / PAGESIZE;
     tmp_lba_range = (offset + size - 1) / PAGESIZE - (tmp_lba) + 1;
+    tmp_buf = calloc(PAGESIZE, sizeof(char));
 
     idx = 0;
     curr_size = 0;
+    remain_size = size;
 
-    for (remain_size = size; remain_size >= PAGESIZE; remain_size -= PAGESIZE)
+    while (remain_size > 0)
     {
-        pca = ftl_get_pca(tmp_lba + idx);
-        ret = ftl_write(&buf[PAGESIZE * idx], tmp_lba_range - idx, tmp_lba + idx);
+        off_t off;
+        int wsize;
 
-        if (ret <= 0)
-        {
-            return ret;
+        off = (offset + curr_size) % PAGESIZE;
+        wsize = remain_size > PAGESIZE - off ? PAGESIZE - off : remain_size;
+
+        if (wsize != PAGESIZE) {
+            //Partial overwrite, need to do read-modify-write
+
+            //Read
+            ret = ftl_read(tmp_buf, tmp_lba + idx);
+
+            if (ret <= 0)
+            {
+                break;
+            }
+
+            //Modify
+            memcpy(&tmp_buf[off], &buf[curr_size], wsize);
+
+            //Write
+            ret = ftl_write(tmp_buf, 1, tmp_lba + idx);
+
+            if (ret <= 0)
+            {
+                break;
+            }
+        } else {
+            //Just overwrite whole page
+            ret = ftl_write(&buf[curr_size], tmp_lba_range - idx, tmp_lba + idx);
+
+            if (ret <= 0)
+            {
+                break;
+            }
         }
-
-        ftl_set_stale(pca);
 
         idx += 1;
-        curr_size += PAGESIZE;
+        curr_size += wsize;
+        remain_size -= wsize;
     }
 
-    if (remain_size)
-    {
-        tmp_buf = calloc(PAGESIZE, sizeof(char));
+    free(tmp_buf);
 
-        //read
-        ret = ftl_read(tmp_buf, tmp_lba + idx);
-
-        if (ret <= 0)
-        {
-            free(tmp_buf);
-            return ret;
-        }
-
-        //modify
-        memcpy(tmp_buf, &buf[curr_size], remain_size);
-
-        //write
-        pca = ftl_get_pca(tmp_lba + idx);
-        ret = ftl_write(tmp_buf, 1, tmp_lba + idx);
-
-        if (ret <= 0)
-        {
-            free(tmp_buf);
-            return ret;
-        }
-
-        ftl_set_stale(pca);
-
-        free(tmp_buf);
-    }
-
-    return size;
+    return curr_size;
 }
 
 static int ssd_write(const char* path, const char* buf, size_t size,
