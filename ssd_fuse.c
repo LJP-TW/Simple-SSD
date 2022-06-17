@@ -253,6 +253,14 @@ static int ftl_write(const char* buf, int lba_range, int lba)
     int ret;
 
     oldpca.pca = L2P[lba].pca;
+
+    // Set stale
+    if (oldpca.pca != INVALID_PCA)
+    {
+        block_state[oldpca.nand].valid_count--;
+        block_state[oldpca.nand].stale |= (1 << oldpca.pidx);
+    }
+
     pca.pca = get_next_pca();
 
     if (pca.pca < 0 || pca.pca == OUT_OF_BLOCK)
@@ -264,15 +272,6 @@ static int ftl_write(const char* buf, int lba_range, int lba)
 
     L2P[lba].pca = pca.pca;
     P2L[PCA_ADDR(pca)] = lba;
-
-    // Set stale
-    if (oldpca.pca == INVALID_PCA)
-    {
-        return ret;
-    }
-
-    block_state[oldpca.nand].valid_count--;
-    block_state[oldpca.nand].stale |= (1 << oldpca.pidx);
 
     return ret;
 }
@@ -287,7 +286,7 @@ static int ftl_write(const char* buf, int lba_range, int lba)
 static int gc(void)
 {
     int blockid, minv, valid;
-    char *buf;
+    char* buf;
     PCA_RULE target_pca;
 
     blockid = -1;
@@ -295,6 +294,11 @@ static int gc(void)
 
     for (int i = 0; i < PHYSICAL_NAND_NUM; ++i)
     {
+        if (i == gc_blockid)
+        {
+            continue;
+        }
+
         if (block_state[i].valid_count < minv)
         {
             minv = block_state[i].valid_count;
